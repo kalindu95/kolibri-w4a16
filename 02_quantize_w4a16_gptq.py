@@ -17,6 +17,8 @@ How it works
 
 Usage:
     python 02_quantize_w4a16_gptq.py --model ./Kolibri-1-bf16 --out ./Kolibri-1-W4A16-G128
+    # uncalibrated round-to-nearest baseline, same scheme/ignore list, for comparison:
+    python 02_quantize_w4a16_gptq.py --model ./Kolibri-1-bf16 --out ./Kolibri-1-W4A16-RTN --rtn
 """
 import argparse
 import torch
@@ -24,7 +26,7 @@ from datasets import concatenate_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import GPTQModifier
+from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
 from llmcompressor.utils import load_context
 
 
@@ -96,6 +98,9 @@ def main():
     ap.add_argument("--dampening-frac", type=float, default=0.01,
                     help="GPTQ Hessian damping; raise to 0.05-0.1 if a layer fails with "
                          "'not positive-definite' (layers with activation outliers)")
+    ap.add_argument("--rtn", action="store_true",
+                    help="round-to-nearest baseline: same scheme and ignore list, no "
+                         "calibration data or Hessians (minutes, not hours)")
     ap.add_argument("--keep-attn-bf16", action="store_true",
                     help="leave attention projections unquantized (+~2.5 GB, safer quality)")
     ap.add_argument("--seq-target", default=None,
@@ -118,6 +123,23 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
+    ignore = ["lm_head", "re:.*mlp.gate$"]
+    if args.keep_attn_bf16:
+        ignore.append("re:.*self_attn\\..*_proj$")
+    weights = {"num_bits": 4, "type": "int", "symmetric": True,
+               "strategy": "group", "group_size": args.group_size}
+    scheme = "W4A16" if args.group_size == 128 else None
+
+    if args.rtn:
+        # load_context() above still linearizes the experts, so RTN quantizes them too
+        quant = dict(scheme=scheme) if scheme else dict(
+            config_groups={"group_0": {"targets": ["Linear"], "weights": weights}})
+        oneshot(model=model, recipe=QuantizationModifier(targets="Linear", ignore=ignore, **quant))
+        model.save_pretrained(args.out, save_compressed=True)
+        tok.save_pretrained(args.out)
+        print(f"saved (RTN) -> {args.out}")
+        return
+
     if args.calib_jsonl:
         ds = tokenize_messages(tok, load_dataset("json", data_files=args.calib_jsonl, split="train"),
                                args.max_len).shuffle(seed=args.seed)
@@ -126,13 +148,9 @@ def main():
     else:
         ds = build_calibration_set(tok, args.samples, args.max_len, args.german_frac, args.seed)
 
-    ignore = ["lm_head", "re:.*mlp.gate$"]
     seq_targets = [args.seq_target] if args.seq_target else list(model._no_split_modules)
     print(f"sequential targets: {seq_targets}")
-    if args.keep_attn_bf16:
-        ignore.append("re:.*self_attn\\..*_proj$")
 
-    scheme = "W4A16" if args.group_size == 128 else None
     if scheme:
         recipe = GPTQModifier(targets="Linear", scheme=scheme, ignore=ignore,
                               dampening_frac=args.dampening_frac, actorder="static")
@@ -140,10 +158,7 @@ def main():
         recipe = GPTQModifier(
             targets="Linear", ignore=ignore, dampening_frac=args.dampening_frac,
             actorder="static",
-            config_groups={"group_0": {
-                "targets": ["Linear"],
-                "weights": {"num_bits": 4, "type": "int", "symmetric": True,
-                            "strategy": "group", "group_size": args.group_size}}})
+            config_groups={"group_0": {"targets": ["Linear"], "weights": weights}})
 
     oneshot(
         model=model,

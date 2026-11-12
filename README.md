@@ -56,20 +56,53 @@ It removes `quantization_config` from config.json.
 - If calibration stops with `linalg.cholesky: ... not positive-definite`, raise the damping with
   `--dampening-frac 0.05` (default 0.01). Layers with large activation outliers trigger this.
   It happened on Qwen3-0.6B's `layers.2.mlp.down_proj`, and 0.05 fixed it.
+- Baseline for comparison: `--rtn` writes an uncalibrated round-to-nearest checkpoint with the
+  same scheme, group size and ignore list (`--out $WORK/Kolibri-1-W4A16-RTN --rtn`). It takes
+  minutes, needs no calibration data, and still linearizes the experts, so they get quantized too.
+  Evaluate it the same way as the GPTQ model. GPTQ should come out clearly better.
 
 **3. Evaluate** (don't skip this)
-```bash
-# quick: perplexity + sample generation, on held-out chat data (not the calib set)
-python 03_compare_ppl.py --ref $WORK/Kolibri-1-bf16 --quant $WORK/Kolibri-1-W4A16-G128 \
-    --jsonl heldout.jsonl --n 64
 
-# proper: same harness and settings for the FP8 original and the 4-bit model
-lm_eval --model vllm \
-  --model_args pretrained=$WORK/Kolibri-1-W4A16-G128,max_model_len=8192,kv_cache_dtype=fp8 \
-  --tasks gsm8k,arc_challenge,mmlu --apply_chat_template --batch_size auto
-# German: check `lm_eval --tasks list | grep -i _de` (e.g. Okapi arc_de / hellaswag_de / m_mmlu_de)
+`run_eval.sh` compares the GPTQ and RTN checkpoints with the original model
+(build RTN first with `02_quantize_w4a16_gptq.py --rtn`). Needs vLLM, `aleph-alpha-inference`
+and `lm-eval[vllm]`.
+
+The defaults fit **one A100 80 GB**:
+- The 4-bit models (~45 GB) run in vLLM.
+- The reference doesn't fit, so the fidelity stage scores the **BF16 copy** once through
+  transformers. About 70 GB of it stays on the GPU and the rest goes to CPU RAM, which needs
+  about 100 GB free. Keep `$WORK/Kolibri-1-bf16` until the evaluation is done.
+- Reference benchmarks are off. Compare GPTQ with RTN, and with the scores on the model card.
+  `BENCH_REF=1 LIMIT=200` runs them on the FP8 model in vLLM with 24 GB of weights in CPU RAM.
+  That's slow and untested on A100.
+- With 2+ GPUs: `REF=$WORK/Kolibri-1 REF_BACKEND=vllm REF_TP=2 BENCH_REF=1`.
+```bash
+WORK=/workspace bash run_eval.sh                               # data, fidelity, bench, summary
+EXTRA_DATA="fin=/data/fin_heldout.jsonl" STAGES=fidelity bash run_eval.sh   # add a financial slice
+LIMIT=100 STAGES=bench bash run_eval.sh                        # quick benchmark pass first
 ```
-Good result: a perplexity increase under about 3–5% and benchmark scores within about 1–2 points of FP8.
+| Stage | Script | What it measures |
+|---|---|---|
+| data | `make_heldout.py` | English (open-perfectblend, rows after the calibration ones) and German (oasst2) held-out chat, 128 each |
+| fidelity | `04_eval_fidelity.py` | Checkpoint check (size, packed tensor and expert counts), then perplexity, KL(ref‖model) and top-1 agreement per slice, plus the worst samples |
+| bench | `lm_eval` on vLLM | gsm8k, arc_challenge, mmlu, ifeval and German arc_de, hellaswag_de, m_mmlu_de, with identical settings for every model |
+| summary | | `$WORK/eval/benchmarks.md` and `$WORK/eval/fidelity/results.md` |
+
+Good result: perplexity up less than about 3–5%, benchmarks within about 1–2 points of FP8,
+and GPTQ clearly better than RTN on KL. If GPTQ and RTN come out about equal, the experts
+probably weren't calibrated.
+
+Notes:
+- KL is a top-k approximation (vLLM returns only the top log-probs). On Qwen3-0.6B it read
+  about 13% below the exact value for both GPTQ and RTN, so model-to-model comparisons hold.
+  Perplexity is exact.
+- Kolibri is a reasoning model: `MAX_GEN_TOKS` (default 8192) must leave room to think,
+  otherwise gsm8k answers get cut off and every model scores low.
+- Don't put German Aya rows in a held-out set: Aya has only ~241 German rows and the default
+  calibration can use all of them.
+- `03_compare_ppl.py` still works for a quick check without vLLM, but it loads models
+  through transformers, which is slow at this size. `04_eval_fidelity.py --backend hf --device cpu`
+  runs the same metrics on small models without vLLM.
 
 **4. Serve**
 ```bash
